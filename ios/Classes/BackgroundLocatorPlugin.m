@@ -22,6 +22,8 @@ static NSString *const kBGRefreshTaskId = @"background.location.tracking.refresh
     CLLocation* _lastLoggedLocation;  // Track last logged location for distance filtering
     CLLocation* _currentLocation;     // Updated on every valid update (for geofence on kill)
     double _geofenceRadius;           // Configurable geofence radius (default 100m)
+    NSMutableArray *_pendingLocationMaps; // Buffer for locations arriving before isolate is ready
+    NSTimer *_flushTimer;             // Retries flushing pending locations until isolate warms up
 }
 
 static FlutterPluginRegistrantCallback registerPlugins = nil;
@@ -277,17 +279,6 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     if (_lastLoggedLocation != nil) {
         CLLocationDistance distance = [location distanceFromLocation:_lastLoggedLocation];
         
-        // GPS spike rejection: reject impossibly fast jumps (GPS hardware glitch)
-        NSTimeInterval timeDelta = [location.timestamp timeIntervalSinceDate:_lastLoggedLocation.timestamp];
-        if (timeDelta > 0) {
-            double impliedSpeed = distance / timeDelta;
-            if (impliedSpeed > 80.0) { // 80 m/s = 288 km/h
-                NSLog(@"[BackgroundLocator] ⚠️ Rejected GPS spike: %.0fm in %.0fs (%.0f m/s) — skipping", distance, timeDelta, impliedSpeed);
-                [[BackgroundTaskHelper shared] end:bgTaskId];
-                return;
-            }
-        }
-        
         if (distance < distanceFilter) {
             shouldLog = NO;
             NSLog(@"[BackgroundLocator] Skipping - moved only %.1fm (< %.0fm threshold)", distance, distanceFilter);
@@ -356,6 +347,65 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     }
 }
 
+- (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager {
+    CLAuthorizationStatus status;
+    
+    if (@available(iOS 14.0, *)) {
+        status = manager.authorizationStatus;
+    } else {
+        status = [CLLocationManager authorizationStatus];
+    }
+    
+    NSLog(@"[BackgroundLocator] 🔐 Authorization changed to: %d", (int)status);
+    
+    switch (status) {
+        case kCLAuthorizationStatusNotDetermined:
+            NSLog(@"[BackgroundLocator] Permission not determined yet");
+            break;
+            
+        case kCLAuthorizationStatusRestricted:
+            NSLog(@"[BackgroundLocator] ❌ Location permission restricted (parental controls or MDM)");
+            break;
+            
+        case kCLAuthorizationStatusDenied:
+            NSLog(@"[BackgroundLocator] ❌ Location permission denied by user");
+            break;
+            
+        case kCLAuthorizationStatusAuthorizedWhenInUse:
+            NSLog(@"[BackgroundLocator] ⚠️ Only 'When In Use' permission granted - background tracking requires 'Always'");
+            // Request upgrade to Always if service should be running
+            if ([PreferencesManager isServiceRunning]) {
+                [_locationManager requestAlwaysAuthorization];
+            }
+            break;
+            
+        case kCLAuthorizationStatusAuthorizedAlways:
+            NSLog(@"[BackgroundLocator] ✅ 'Always' permission granted");
+            
+            // Start tracking if service should be running
+            if ([PreferencesManager isServiceRunning]) {
+                // Bootstrap _currentLocation from last known position
+                CLLocation *lastKnown = [_locationManager location];
+                if (lastKnown != nil && lastKnown.horizontalAccuracy >= 0) {
+                    _currentLocation = lastKnown;
+                    [self observeRegionForLocation:lastKnown];
+                    NSLog(@"[BackgroundLocator] Initial geofence created from last known location (accuracy: %.1fm)", lastKnown.horizontalAccuracy);
+                }
+                
+                // Start location updates
+                [_locationManager startUpdatingLocation];
+                [_locationManager startMonitoringSignificantLocationChanges];
+                
+                NSLog(@"[BackgroundLocator] ✅ Location tracking started after permission grant");
+            }
+            break;
+            
+        default:
+            NSLog(@"[BackgroundLocator] Unknown authorization status: %d", (int)status);
+            break;
+    }
+}
+
 - (void)locationManager:(CLLocationManager *)manager monitoringDidFailForRegion:(CLRegion *)region withError:(NSError *)error {
     NSLog(@"[BackgroundLocator] ❌ Geofence monitoring failed for %@: %@", region.identifier, error.localizedDescription);
     
@@ -370,16 +420,59 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
 
 #pragma mark LocatorPlugin Methods
 - (void) sendLocationEvent: (NSDictionary<NSString*,NSNumber*>*)location {
-    NSString *isolateId = [_headlessRunner isolateId];
-    if (_callbackChannel == nil || isolateId == nil) {
-        return;
-    }
-    
     NSDictionary *map = @{
                      kArgCallback : @([PreferencesManager getCallbackHandle:kCallbackKey]),
                      kArgLocation: location
                      };
+    
+    NSString *isolateId = [_headlessRunner isolateId];
+    if (_callbackChannel == nil || isolateId == nil) {
+        // Isolate not ready yet (first-run warmup) — buffer and retry
+        if (_pendingLocationMaps == nil) {
+            _pendingLocationMaps = [NSMutableArray array];
+        }
+        if (_pendingLocationMaps.count < 10) { // Cap buffer at 10 locations
+            [_pendingLocationMaps addObject:map];
+            NSLog(@"[BackgroundLocator] Isolate not ready — buffered location (%lu pending)", (unsigned long)_pendingLocationMaps.count);
+        }
+        // Start flush timer if not already running
+        if (_flushTimer == nil) {
+            _flushTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                                          target:self
+                                                        selector:@selector(flushPendingLocations)
+                                                        userInfo:nil
+                                                         repeats:YES];
+        }
+        return;
+    }
+    
+    // Flush any buffered locations before sending the new one
+    [self flushPendingLocations];
+    
     [_callbackChannel invokeMethod:kBCMSendLocation arguments:map];
+}
+
+- (void)flushPendingLocations {
+    NSString *isolateId = [_headlessRunner isolateId];
+    if (_callbackChannel == nil || isolateId == nil) {
+        return; // Still not ready — timer will retry
+    }
+    
+    // Stop the retry timer
+    if (_flushTimer != nil) {
+        [_flushTimer invalidate];
+        _flushTimer = nil;
+    }
+    
+    if (_pendingLocationMaps.count == 0) {
+        return;
+    }
+    
+    NSLog(@"[BackgroundLocator] Isolate ready — flushing %lu buffered location(s)", (unsigned long)_pendingLocationMaps.count);
+    for (NSDictionary *pendingMap in _pendingLocationMaps) {
+        [_callbackChannel invokeMethod:kBCMSendLocation arguments:pendingMap];
+    }
+    [_pendingLocationMaps removeAllObjects];
 }
 
 - (instancetype)init:(NSObject<FlutterPluginRegistrar> *)registrar {
@@ -450,7 +543,21 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
   initialDataDictionary:(NSDictionary*)initialDataDictionary
         disposeCallback:(int64_t)disposeCallback
                settings: (NSDictionary*)settings {
-    [self->_locationManager requestAlwaysAuthorization];
+    // Check current authorization status before requesting
+    CLAuthorizationStatus currentStatus;
+    if (@available(iOS 14.0, *)) {
+        currentStatus = _locationManager.authorizationStatus;
+    } else {
+        currentStatus = [CLLocationManager authorizationStatus];
+    }
+    
+    NSLog(@"[BackgroundLocator] Current authorization status: %d", (int)currentStatus);
+    
+    // Request authorization if not already granted
+    if (currentStatus != kCLAuthorizationStatusAuthorizedAlways) {
+        NSLog(@"[BackgroundLocator] Requesting 'Always' authorization...");
+        [self->_locationManager requestAlwaysAuthorization];
+    }
         
     long accuracyKey = [[settings objectForKey:kSettingsAccuracy] longValue];
     CLLocationAccuracy accuracy = [Util getAccuracy:accuracyKey];
@@ -500,9 +607,16 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
         [self observeRegionForLocation:lastKnown];
         NSLog(@"[BackgroundLocator] Initial geofence bootstrapped from last known location (accuracy: %.1fm)", lastKnown.horizontalAccuracy);
     }
-        
-    [_locationManager startUpdatingLocation];
-    [_locationManager startMonitoringSignificantLocationChanges];
+    
+    // Only start location updates if we already have 'Always' permission
+    // Otherwise, wait for locationManagerDidChangeAuthorization callback
+    if (currentStatus == kCLAuthorizationStatusAuthorizedAlways) {
+        [_locationManager startUpdatingLocation];
+        [_locationManager startMonitoringSignificantLocationChanges];
+        NSLog(@"[BackgroundLocator] ✅ Started location updates (permission already granted)");
+    } else {
+        NSLog(@"[BackgroundLocator] ⏳ Waiting for authorization grant before starting location updates");
+    }
     
     // Schedule BGAppRefreshTask so iOS can wake the app even when killed
     [self scheduleBGAppRefreshTask];
