@@ -22,7 +22,7 @@
             NSLog(@"[BackgroundLocator] CLServiceSession already active");
             return;
         }
-        _session = [[CLServiceSession alloc] initWithAuthorization:CLServiceSessionAuthorizationTypeAlways];
+        _session = [CLServiceSession sessionRequiringAuthorization:CLServiceSessionAuthorizationRequirementAlways];
         NSLog(@"[BackgroundLocator] CLServiceSession started");
     }
 #endif
