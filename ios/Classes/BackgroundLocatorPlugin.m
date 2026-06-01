@@ -204,13 +204,33 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     // 4. Re-schedule the next wake-up IMMEDIATELY so the chain continues
     [self scheduleBGAppRefreshTask];
     
-    // 5. Allow ~20 seconds for a location fix to arrive and be processed,
-    //    then STOP continuous GPS (geofence + SLC will handle next wake-up)
-    //    to avoid battery drain from GPS running indefinitely.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
+    // 5. Allow ~22 seconds for a location fix to arrive and be processed.
+    //    If no fresh fix arrived (indoor/weak GPS), fall back to last cached
+    //    position so stationary users still get a heartbeat log.
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(22.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        BackgroundLocatorPlugin *strongSelf = weakSelf;
+        if (!strongSelf) return;
+
         NSLog(@"[BackgroundLocator] BGAppRefreshTask window complete — stopping continuous GPS");
-        [_locationManager stopUpdatingLocation]; // Stop GPS; geofence/SLC will wake next time
+        [strongSelf->_locationManager stopUpdatingLocation];
+
+        // Fallback: If didUpdateLocations never processed a point during this task window,
+        // use the last cached location as a heartbeat to prevent gaps in tracking data for stationary or indoor users.
+        CLLocation *fallback = strongSelf->_currentLocation ?: strongSelf->_locationManager.location;
+        if (fallback != nil && fallback.horizontalAccuracy >= 0) {
+            NSTimeInterval age = [[NSDate date] timeIntervalSinceDate:fallback.timestamp];
+            // Accept cache up to 2 hours old to account for standard iOS BG refresh intervals
+            if (age < 7200) {
+                NSLog(@"[BackgroundLocator] BGAppRefreshTask fallback — using cached location (age=%.0fs, accuracy=%.1fm)",
+                      age, fallback.horizontalAccuracy);
+                [strongSelf prepareLocationMap:fallback];
+            } else {
+                NSLog(@"[BackgroundLocator] BGAppRefreshTask fallback — cached location too old (age=%.0fs), skipping", age);
+            }
+        }
+
         [[BackgroundTaskHelper shared] end:bgTaskId];
         if (!taskCompleted) {
             taskCompleted = YES;
